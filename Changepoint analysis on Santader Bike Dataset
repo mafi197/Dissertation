@@ -1,0 +1,519 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+import os
+from pathlib import Path
+import datetime
+import gc
+import warnings
+warnings.filterwarnings('ignore')
+
+print(f"Current Date and Time (UTC): {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print(f"Current User's Login: mafi197")
+print("-" * 60)
+
+def find_csv_files(base_folder="csv_files"):
+    possible_paths = [
+        Path(base_folder),
+        Path(base_folder) / "csv_files",
+        Path("./csv_files"),
+        Path("../csv_files"),
+        Path(".")
+    ]
+    
+    for path in possible_paths:
+        try:
+            if path.exists():
+                csv_files = [f for f in os.listdir(path) if f.endswith('.csv')]
+                if csv_files:
+                    return path, csv_files
+        except Exception:
+            continue
+    
+    raise ValueError("No CSV files found in any of the checked locations")
+
+def load_full_bike_data(data_folder="csv_files", min_journeys=100):
+    print(f"Loading FULL bike journey dataset (with stations having >{min_journeys} journeys)...")
+    
+    try:
+        data_path, csv_file_names = find_csv_files(data_folder)
+        all_csv_files = [data_path / name for name in sorted(csv_file_names)]
+        
+        print(f"Found {len(all_csv_files)} CSV files (weeks)")
+        
+        print("Identifying all unique stations...")
+        station_counts = {}
+        start_time = datetime.datetime.now()
+        
+        for i, csv_file in enumerate(all_csv_files):
+            if i % 10 == 0:
+                elapsed = (datetime.datetime.now() - start_time).total_seconds()
+                if i > 0:
+                    est_total = (elapsed / i) * len(all_csv_files)
+                    print(f"  Processed {i}/{len(all_csv_files)} files - {elapsed:.1f}s elapsed, est. {est_total-elapsed:.1f}s remaining")
+            try:
+                df = pd.read_csv(csv_file)
+                for _, row in df.iterrows():
+                    start_id = row.get('StartStation Id')
+                    end_id = row.get('EndStation Id')
+                    
+                    if pd.notna(start_id) and pd.notna(end_id):
+                        start_id = int(start_id)
+                        end_id = int(end_id)
+                        
+                        station_counts[start_id] = station_counts.get(start_id, 0) + 1
+                        station_counts[end_id] = station_counts.get(end_id, 0) + 1
+            except Exception as e:
+                print(f"  Error in file {i}: {str(e)[:50]}")
+                continue
+        
+        active_stations = [sid for sid, count in station_counts.items() if count >= min_journeys]
+        
+        station_mapping = {sid: idx for idx, sid in enumerate(sorted(active_stations))}
+        num_stations = len(station_mapping)
+        
+        print(f"Selected {num_stations} stations with ≥{min_journeys} journeys")
+        print(f"Creating journey tensor of shape: {num_stations}×{num_stations}×{len(all_csv_files)}")
+        
+        if num_stations > 100:
+            print(f"⚠️ WARNING: Large tensor size detected ({num_stations}×{num_stations}×{len(all_csv_files)})!")
+            print(f"   This may require significant memory and processing time.")
+            print(f"   Consider increasing min_journeys if you encounter memory issues.")
+        
+        T = len(all_csv_files)
+        journey_tensor = np.zeros((num_stations, num_stations, T), dtype=np.float32)
+        
+        print(f"Processing all {len(all_csv_files)} weekly files to build tensor...")
+        start_time = datetime.datetime.now()
+        total_journeys = 0
+        
+        for file_idx, csv_file in enumerate(all_csv_files):
+            if file_idx % 10 == 0:
+                elapsed = (datetime.datetime.now() - start_time).total_seconds()
+                if file_idx > 0:
+                    est_total = (elapsed / file_idx) * len(all_csv_files)
+                    print(f"  Processed {file_idx}/{len(all_csv_files)} files - {elapsed:.1f}s elapsed, est. {est_total-elapsed:.1f}s remaining")
+                    print(f"  {total_journeys:,} journeys added so far")
+            
+            try:
+                df = pd.read_csv(csv_file)
+                file_journeys = 0
+                
+                for _, row in df.iterrows():
+                    try:
+                        start_id = row.get('StartStation Id')
+                        end_id = row.get('EndStation Id')
+                        
+                        if pd.notna(start_id) and pd.notna(end_id):
+                            start_id = int(start_id)
+                            end_id = int(end_id)
+                            
+                            if start_id in station_mapping and end_id in station_mapping:
+                                i = station_mapping[start_id]
+                                j = station_mapping[end_id]
+                                journey_tensor[i, j, file_idx] += 1
+                                file_journeys += 1
+                    except Exception:
+                        continue
+                
+                total_journeys += file_journeys
+                    
+            except Exception as e:
+                print(f"  Error in file {file_idx}: {str(e)[:50]}")
+                continue
+        
+        elapsed = (datetime.datetime.now() - start_time).total_seconds()
+        print(f"Data loading complete in {elapsed:.1f} seconds!")
+        print(f"  Tensor shape: {journey_tensor.shape}")
+        print(f"  Total journeys: {journey_tensor.sum():,.0f}")
+        
+        t = np.arange(T)
+        
+        return journey_tensor, t, station_mapping
+        
+    except Exception as e:
+        print(f"Critical error in data loading: {str(e)}")
+        raise
+
+def create_hankel_matrix(X, order):
+    num_features, sequence_length = X.shape
+    n_cols = sequence_length - order + 1
+    H = np.zeros((num_features * order, n_cols))
+    
+    for i in range(order):
+        H[i * num_features:(i + 1) * num_features, :] = X[:, i:i + n_cols]
+    
+    return H
+
+class DMDChangepoint:
+    def __init__(self, window=10, order=3, rank_ratio=0.7):
+        self.window = window
+        self.order = order
+        self.rank_ratio = rank_ratio
+    
+    def compute_reconstruction_errors(self, data_3d):
+        d1, d2, T = data_3d.shape
+        num_features = d1 * d2
+        
+        data_2d = data_3d.reshape(num_features, T)
+        
+        errors = []
+        start_time = datetime.datetime.now()
+        
+        batch_size = 10 if T > 100 else T - self.window + 1
+        
+        for batch_start in range(self.window, T, batch_size):
+            batch_end = min(batch_start + batch_size, T)
+            batch_errors = []
+            
+            for t in range(batch_start, batch_end):
+                if (t - self.window) % 10 == 0 or t == T-1:
+                    elapsed = (datetime.datetime.now() - start_time).total_seconds()
+                    progress = (t - self.window) / (T - self.window)
+                    if progress > 0:
+                        est_total = elapsed / progress
+                        print(f"  Computing errors: {t-self.window}/{T-self.window} time points - {elapsed:.1f}s elapsed, est. {est_total-elapsed:.1f}s remaining")
+                
+                try:
+                    X = data_2d[:, t-self.window:t]
+                    
+                    H = create_hankel_matrix(X, self.order)
+                    
+                    if np.isnan(H).any() or np.isinf(H).any():
+                        print(f"Warning: NaN or Inf in Hankel matrix at time {t}")
+                        if batch_errors:
+                            batch_errors.append(batch_errors[-1])
+                        else:
+                            batch_errors.append(0.0)
+                        continue
+                    
+                    try:
+                        U, S, Vh = np.linalg.svd(H, full_matrices=False)
+                        
+                        total_energy = np.sum(S**2)
+                        if total_energy <= 0:
+                            raise ValueError("SVD energy is zero")
+                            
+                        cumulative_energy = np.cumsum(S**2) / total_energy
+                        r = np.searchsorted(cumulative_energy, self.rank_ratio) + 1
+                        r = max(1, min(r, len(S)))
+                        
+                        U_r = U[:, :r]
+                        S_r = S[:r]
+                        Vh_r = Vh[:r, :]
+                        
+                        H_hat = U_r @ np.diag(S_r) @ Vh_r
+                        
+                        if np.linalg.norm(H) > 0:
+                            error = np.linalg.norm(H - H_hat, 'fro') / np.linalg.norm(H, 'fro')
+                        else:
+                            error = 0.0
+                        batch_errors.append(error)
+                        
+                    except Exception as e:
+                        print(f"SVD computation error at time {t}: {str(e)}")
+                        if batch_errors:
+                            batch_errors.append(batch_errors[-1])
+                        else:
+                            batch_errors.append(0.0)
+                
+                except Exception as e:
+                    print(f"Error computing reconstruction at time {t}: {str(e)}")
+                    if batch_errors:
+                        batch_errors.append(batch_errors[-1])
+                    else:
+                        batch_errors.append(0.0)
+            
+            errors.extend(batch_errors)
+            gc.collect()
+        
+        return errors
+
+class AdaptiveEWMA:
+    def __init__(self, gamma=0.3, ell=1.0, history_size=10):
+        self.gamma = gamma
+        self.ell = ell
+        self.mean = 0
+        self.variance = 1e-4
+        self.statistic = 0
+        self.n = 0
+        self.detected_change = False
+        self.history = []
+        self.history_size = history_size
+    
+    def initialise_statistics(self, initial_values):
+        self.history = list(initial_values[-self.history_size:])
+        self.mean = np.mean(self.history)
+        self.variance = np.var(self.history) + 1e-4
+    
+    def update_statistics(self, value):
+        self.n += 1
+        self.history.append(value)
+        if len(self.history) > self.history_size:
+            self.history.pop(0)
+    
+    def update_mean_variance(self, value):
+        self.mean = np.mean(self.history)
+        
+        if len(self.history) > 1:
+            self.variance = max(1e-4, np.var(self.history))
+        
+        std = np.sqrt(self.variance)
+        normalized_value = (value - self.mean) / std
+        self.statistic = (1 - self.gamma) * self.statistic + self.gamma * normalized_value
+    
+    def decision_rule(self):
+        if abs(self.statistic) > self.ell and self.n >= 3:
+            self.detected_change = True
+        return self.detected_change
+
+def detect_changepoints_ewma(errors, gamma=0.3, ell=1.0, burn_in=15, history_size=8):
+    if len(errors) < burn_in + 3:
+        return []
+    
+    increments = np.diff(errors)
+    
+    increments = np.nan_to_num(increments, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    ewma = AdaptiveEWMA(gamma=gamma, ell=ell, history_size=history_size)
+    
+    ewma.initialise_statistics(increments[:history_size])
+    
+    changepoints = []
+    
+    for t in range(history_size, len(increments)):
+        delta = increments[t]
+        
+        if np.isnan(delta) or np.isinf(delta):
+            continue
+            
+        ewma.update_statistics(delta)
+        ewma.update_mean_variance(delta)
+        
+        if t >= burn_in and ewma.decision_rule():
+            changepoint = t + 1
+            changepoints.append(changepoint)
+            print(f"Detected changepoint at week {changepoint}")
+            
+            ewma = AdaptiveEWMA(gamma=gamma, ell=ell, history_size=history_size)
+            
+            if t + history_size < len(increments):
+                ewma.initialise_statistics(increments[t+1:t+1+history_size])
+                t += history_size
+            else:
+                break
+    
+    return changepoints
+
+def plot_bike_data_with_changepoints(data_3d, t, detected_cps, station_mapping, title="Bike Journey Data with Changepoints"):
+    d1, d2, T = data_3d.shape
+    
+    top_pairs = []
+    for i in range(d1):
+        for j in range(d2):
+            total = data_3d[i, j].sum()
+            if total > 0:
+                top_pairs.append((i, j, total))
+    
+    top_pairs.sort(key=lambda x: x[2], reverse=True)
+    pairs_to_show = min(9, len(top_pairs))
+    
+    plt.figure(figsize=(15, 12))
+    plt.suptitle(title, fontsize=16)
+    
+    for idx, (i, j, total) in enumerate(top_pairs[:pairs_to_show]):
+        plt.subplot(3, 3, idx + 1)
+        
+        plt.plot(t, data_3d[i, j], linewidth=2)
+        
+        for cp in detected_cps:
+            if cp < T:
+                plt.axvline(x=cp, color='r', linestyle='-', linewidth=2, label='Changepoint')
+        
+        if station_mapping:
+            station_ids = list(station_mapping.keys())
+            start_id = station_ids[i]
+            end_id = station_ids[j]
+            plt.title(f'Station {start_id} → {end_id}\n{int(total)} total journeys', fontsize=10)
+        else:
+            plt.title(f'Route {i} → {j}\n{int(total)} journeys', fontsize=10)
+        
+        plt.xlabel('Week')
+        plt.ylabel('Journeys')
+        plt.grid(True, alpha=0.3)
+        
+        if idx == 0:
+            handles, labels = plt.gca().get_legend_handles_labels()
+            by_label = dict(zip(labels, handles))
+            plt.legend(by_label.values(), by_label.keys(), loc='upper right', fontsize=8)
+    
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.92)
+    plt.savefig('bike_changepoints_full_dmd.png', dpi=150)
+    plt.show()
+
+def plot_error_dynamics(errors, detected_cps, window, title="DMD Reconstruction Error Dynamics"):
+    plt.figure(figsize=(15, 8))
+    
+    weeks = np.arange(window, window + len(errors))
+    
+    plt.plot(weeks, errors, 'b-', linewidth=2, label='Reconstruction Error')
+    plt.title('DMD Reconstruction Error over Time', fontsize=14)
+    
+    for cp in detected_cps:
+        plt.axvline(x=cp, color='r', linestyle='-', linewidth=2, label='Changepoint')
+    
+    plt.ylabel('Error')
+    plt.grid(True, alpha=0.3)
+    
+    handles, labels = plt.gca().get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    plt.legend(by_label.values(), by_label.keys(), loc='upper right')
+    
+    plt.xlabel('Week')
+    plt.tight_layout()
+    plt.savefig('error_dynamics_full_dmd.png', dpi=150)
+    plt.show()
+
+def plot_error_increments(errors, detected_cps, window, title="Error Increments"):
+    plt.figure(figsize=(15, 8))
+    
+    increments = np.diff(errors)
+    
+    weeks = np.arange(window + 1, window + len(increments) + 1)
+    
+    plt.plot(weeks, increments, 'g-', linewidth=1.5, label='Error Increment')
+    plt.title('DMD Reconstruction Error Increments', fontsize=14)
+    
+    plt.axhline(y=0, color='k', linestyle='--', alpha=0.3)
+    
+    for cp in detected_cps:
+        plt.axvline(x=cp, color='r', linestyle='-', linewidth=2, label='Changepoint')
+    
+    plt.ylabel('Increment')
+    plt.grid(True, alpha=0.3)
+    
+    handles, labels = plt.gca().get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    plt.legend(by_label.values(), by_label.keys(), loc='upper right')
+    
+    plt.xlabel('Week')
+    plt.tight_layout()
+    plt.savefig('error_increments_full_dmd.png', dpi=150)
+    plt.show()
+
+def multi_parameter_changepoint_detection(data_3d, t):
+    print("\n=== ROBUST MULTI-PARAMETER CHANGEPOINT DETECTION ===")
+    
+    d1, d2, T = data_3d.shape
+    print(f"Working with tensor of shape {d1}×{d2}×{T}")
+    
+    param_sets = [
+        (10, 3, 0.9, 0.3, 1.0, 15, 8),
+        (8, 2, 0.8, 0.25, 0.9, 12, 6),
+        (12, 4, 0.95, 0.35, 1.1, 20, 10),
+        (6, 2, 0.7, 0.4, 0.85, 10, 5)
+    ]
+    
+    all_changepoints = []
+    all_errors = []
+    
+    for i, params in enumerate(param_sets):
+        window, order, rank_ratio, gamma, ell, burn_in, history_size = params
+        
+        print(f"\nTrying parameter set {i+1}:")
+        print(f"  window={window}, order={order}, rank_ratio={rank_ratio}")
+        print(f"  gamma={gamma}, ell={ell}, burn_in={burn_in}")
+        
+        dmd_cp = DMDChangepoint(window=window, order=order, rank_ratio=rank_ratio)
+        
+        try:
+            errors = dmd_cp.compute_reconstruction_errors(data_3d)
+            all_errors.append(errors)
+            
+            if len(errors) == 0 or np.all(np.isnan(errors)) or np.all(np.array(errors) == 0):
+                print("  No valid errors computed, skipping this parameter set")
+                continue
+                
+            changepoints = detect_changepoints_ewma(
+                errors, gamma=gamma, ell=ell, burn_in=burn_in, history_size=history_size
+            )
+            
+            changepoints = [cp + window for cp in changepoints]
+            
+            print(f"  Detected {len(changepoints)} changepoints at weeks: {changepoints}")
+            
+            all_changepoints.extend(changepoints)
+            
+            if changepoints:
+                plot_error_dynamics(errors, changepoints, window, 
+                                  title=f"Parameter Set {i+1}: {len(changepoints)} Changepoints")
+        
+        except Exception as e:
+            print(f"  Error with parameter set {i+1}: {str(e)}")
+    
+    unique_changepoints = list(set(all_changepoints))
+    unique_changepoints.sort()
+    
+    print(f"\nCombined results: {len(unique_changepoints)} unique changepoints")
+    print(f"Detected weeks: {unique_changepoints}")
+    
+    best_index = 0
+    max_changepoints = 0
+    
+    for i, errors in enumerate(all_errors):
+        if len(errors) > 0:
+            params = param_sets[i]
+            window = params[0]
+            changepoints = detect_changepoints_ewma(errors, gamma=params[3], ell=params[4], 
+                                                 burn_in=params[5], history_size=params[6])
+            adjusted_cps = [cp + window for cp in changepoints]
+            
+            if len(adjusted_cps) > max_changepoints:
+                max_changepoints = len(adjusted_cps)
+                best_index = i
+    
+    if all_errors:
+        best_errors = all_errors[best_index]
+        best_window = param_sets[best_index][0]
+        
+        plot_bike_data_with_changepoints(
+            data_3d, t, unique_changepoints, None,
+            title=f"Bike Journey Data with {len(unique_changepoints)} Detected Changepoints"
+        )
+        
+        plot_error_dynamics(
+            best_errors, unique_changepoints, best_window,
+            title="DMD Reconstruction Error with All Detected Changepoints"
+        )
+        
+        plot_error_increments(
+            best_errors, unique_changepoints, best_window,
+            title="DMD Error Increments with All Detected Changepoints"
+        )
+    
+    return unique_changepoints
+
+def run_full_bike_analysis():
+    print("\n=== FULL BIKE JOURNEY CHANGEPOINT DETECTION ===")
+    start_time = datetime.datetime.now()
+    
+    print("\n⚠️ WARNING: Running analysis on the FULL dataset may take 30+ minutes to several hours.")
+    print("The computation time depends on the number of stations in the dataset.\n")
+    
+    print("\nSTEP 1: LOADING FULL DATASET")
+    data_3d, t, station_mapping = load_full_bike_data(min_journeys=100)
+    
+    print("\nSTEP 2: DETECTING CHANGEPOINTS")
+    print(f"Detected {len(changepoints)} changepoints at weeks:")
+    for i, cp in enumerate(changepoints):
+    changepoints = multi_parameter_changepoint_detection(data_3d, t)
+    
+    runtime = datetime.datetime.now() - start_time
+    print(f"\nAnalysis complete in {runtime}!")
+        print(f"  {i+1}. Week {cp}")
+    
+    return changepoints
+
+if __name__ == "__main__":
+    run_full_bike_analysis()
